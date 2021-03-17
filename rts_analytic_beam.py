@@ -89,21 +89,16 @@ def RTS_analytic_beam(az, za, metafits_delays, freq, norm=True):
 
             PhaseShift = np.exp( multiplier * ( dipl_e*proj_e + dipl_n*proj_n + dipl_z*proj_z - rts_delays[k]*VEL_LIGHT ) )
 
-            # // sum for p receptors
+            gain1 = complex(1.0, 0.0)
+            phase1 = 0.0j
 
-            k_gain  = k
-            k_phase = k_gain + 2*NUM_DIPOLES
-            tmp_response = complex(1.0, 0.0) * np.exp(0.0j) * PhaseShift
-            response[0] += tmp_response
-            response[1] += tmp_response
+            response[0] += gain1 * np.exp(phase1) * PhaseShift
+            response[1] += gain1 * np.exp(phase1) * PhaseShift
 
-            # // sum for q receptors
-
-            k_gain  += NUM_DIPOLES
-            k_phase += NUM_DIPOLES
-            tmp_response = complex(1.0, 0.0) * np.exp(0.0j) * PhaseShift
-            response[2] += tmp_response
-            response[3] += tmp_response
+            gain2 = complex(1.0, 0.0)
+            phase2 = 0.0j
+            response[2] += gain2 * np.exp(phase2) * PhaseShift
+            response[3] += gain2 * np.exp(phase2) * PhaseShift
 
             k += 1
 
@@ -125,5 +120,94 @@ def RTS_analytic_beam(az, za, metafits_delays, freq, norm=True):
     response[1] *= rot[1] * ground_plane / NUM_DIPOLES
     response[2] *= rot[2] * ground_plane / NUM_DIPOLES
     response[3] *= rot[3] * ground_plane / NUM_DIPOLES
+
+    return response
+
+
+
+def RTS_analytic_beam_array(azs, zas, metafits_delays, freq, norm=True):
+    """Calculates the MWA beam response using the RTS MWA analytic beam code.
+    This is basically a direct translation from C code, I have preserved
+    the comments within from the RTS itself
+
+    Parameters
+    ==========
+    azs : float
+        azsimuth, where north = 0, and increases towards east
+    zas : float
+        Zenith Angle
+    metafits_delays : list/array
+        Length 16 array of dipole delays as ordered in the metafits file
+    freq : float
+        Frequency to calculate beam at (Hz)
+    norm : boolean
+        If True, normalise the beam to zenith (default True)
+    """
+
+    rts_delays = reorderDelays2RTS(metafits_delays)
+
+    wavelength = VEL_LIGHT / freq
+
+    lat = MWA_LAT_RAD
+    dpl_sep = 1.1
+    dpl_hgt = MWA_DIPOLE_HEIGHT
+
+    ##Hold the complex jones matrix
+    response = np.zeros((len(azs),4), dtype=complex)
+    ha, dec = erfa.ae2hd(azs, np.pi/2 - zas, MWA_LAT_RAD)
+
+    # // set elements of the look-dir vector
+    proj_e = np.sin(zas)*np.sin(azs)
+    proj_n = np.sin(zas)*np.cos(azs)
+    proj_z = np.cos(zas)
+
+    n_cols = 4
+    n_rows = 4
+
+    multiplier = R2C_SIGN * 1j * 2 * np.pi / wavelength
+    k = 0
+
+    # /* loop over dipoles */
+    for i in np.arange(n_cols):
+        for j in np.arange(n_rows):
+
+        # // set elements of the baseline vector
+            dipl_e = (i - 1.5) * dpl_sep
+            dipl_n = (j - 1.5) * dpl_sep
+            dipl_z = 0.0
+
+            PhaseShift = np.exp( multiplier * ( dipl_e*proj_e + dipl_n*proj_n + dipl_z*proj_z - rts_delays[k]*VEL_LIGHT ) )
+
+            gain1 = complex(1.0, 0.0)
+            phase1 = 0.0j
+
+            response[:,0] += gain1 * np.exp(phase1) * PhaseShift
+            response[:,1] += gain1 * np.exp(phase1) * PhaseShift
+
+            gain2 = complex(1.0, 0.0)
+            phase2 = 0.0j
+            response[:,2] += gain2 * np.exp(phase2) * PhaseShift
+            response[:,3] += gain2 * np.exp(phase2) * PhaseShift
+
+            k += 1
+
+    ground_plane = 2.0*np.sin(2.0*np.pi*dpl_hgt/wavelength*np.cos(erfa.seps(0.0,lat,ha,dec)))
+
+    if norm:
+      ground_plane /= 2.0*np.sin(2.0*np.pi*dpl_hgt/wavelength)
+
+    rot = np.empty((len(azs),4))
+
+    rot[:,0] =  np.cos(lat)*np.cos(dec) + np.sin(lat)*np.sin(dec)*np.cos(ha-0.0)
+    rot[:,1] = -np.sin(lat)*np.sin(ha-0.0)
+    rot[:,2] =  np.sin(dec)*np.sin(ha-0.0)
+    rot[:,3] =  np.cos(ha-0.0)
+
+    # // rot is the Jones matrix, response just contains the phases,
+    # so this should be an element-wise multiplication.
+    response[:,0] *= rot[:,0] * ground_plane / NUM_DIPOLES
+    response[:,1] *= rot[:,1] * ground_plane / NUM_DIPOLES
+    response[:,2] *= rot[:,2] * ground_plane / NUM_DIPOLES
+    response[:,3] *= rot[:,3] * ground_plane / NUM_DIPOLES
 
     return response

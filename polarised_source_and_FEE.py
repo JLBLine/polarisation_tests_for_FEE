@@ -2,6 +2,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import erfa
+from astropy.io import fits
+from astropy.wcs import WCS
+import mwa_hyperbeam
+import os
+from rts_analytic_beam import RTS_analytic_beam, RTS_analytic_beam_array
+import matplotlib.animation as animation
 
 ##Some constants
 D2R = np.pi / 180.0
@@ -311,7 +317,7 @@ def rotate_jones_para(ha_rad, dec_rad, jones, para_angle_offset=np.pi/2):
     return rot_jones
 
 
-def recover_stokes_rm_from_jones(jones_per_freq, stokes):
+def recover_stokes_rm_from_jones(jones_per_freq, stokes, wavelens_squared):
     """
     Recovers observed Stokes params and Faraday Depth Function (FDF) for a
     gives Jones matrix as a function of frequency `jones_per_freq` and
@@ -644,3 +650,356 @@ def remap_hbeam_jones(hbeam_jones):
     new_shape_jones[:,1,1] = hbeam_jones[:,3]
 
     return new_shape_jones
+
+def get_sin_projected_coords(nside = 301):
+    ##Give it 301 pixel for each axis
+
+    header = fits.Header()
+
+    lst_deg = 0.0
+
+    ##This resolution seems to cover the full sky nicely
+    cpix = int(nside // 2)
+    cdelt = 0.25
+    cdelt = 125 / nside
+
+    header['NAXIS']   = 2
+    header['NAXIS1']  = nside
+    header['NAXIS2']  = nside
+    header['CTYPE1']  = 'RA---SIN'
+    header['CRPIX1']  = cpix
+    header['CRVAL1']  = lst_deg
+    header['CDELT1']  = cdelt
+    header['CUNIT1']  = 'deg     '
+    header['CTYPE2']  = 'DEC--SIN'
+    header['CRPIX2']  = cpix
+    header['CRVAL2']  = MWA_LAT
+    header['CDELT2']  = cdelt
+    header['CUNIT2']  = 'deg     '
+
+    ##Make a world coord system
+    wcs = WCS(header)
+
+    ##Set up x/y pixels that cover the whole image
+    x_mesh, y_mesh = np.meshgrid(np.arange(nside), np.arange(nside))
+
+    x_pixels = x_mesh.flatten()
+    y_pixels = y_mesh.flatten()
+
+    ##convert to ra, dec
+    ras, decs = wcs.all_pix2world(x_pixels, y_pixels, 0.0)
+
+    ##Then use erfa to convert these values into azs, els
+    has = lst_deg - ras
+
+    ##use this erfa function to convert to azimuth and elevation
+    ##were using degrees, but erfa uses rads, so convert here
+    az_grid, els = erfa.hd2ae(has*D2R, decs*D2R, MWA_LAT_RAD);
+
+    ##convert elevation to zenith angle
+    za_grid = np.pi/2 - els
+
+    za_grid.shape = (nside,nside)
+    az_grid.shape = (nside,nside)
+
+    ##Mask below horizon for better plots
+    below_horizon = np.where(za_grid > np.pi/2)
+    az_grid[below_horizon] = np.nan
+    za_grid[below_horizon] = np.nan
+
+    return wcs, az_grid.flatten(), za_grid.flatten(), has*D2R, decs*D2R
+
+def get_jones_per_freq(az_rad, za_rad, ha_rad, dec_rad, freqs_hz, beam_model='unity', delays=[1]*16):
+    if beam_model == 'unity':
+        rot_jones_per_freq = np.zeros((len(freqs_hz),2,2),dtype=complex)
+        rot_jones_per_freq[:,0,0] = complex(1,0)
+        rot_jones_per_freq[:,1,1] = complex(1,0)
+
+    elif beam_model=='hyper' or beam_model=='hyper_rev' or beam_model=='hyper_flip':
+        ##Create the beam
+        beam = mwa_hyperbeam.FEEBeam()
+
+        ##Container for Jones as a function of frequency
+        jones_per_freq = np.empty((len(freqs_hz),2,2),dtype=complex)
+
+        ##For each frequency, calculate the Jones, and shove into jones_per_freq
+        for ind, freq_hz in enumerate(freqs_hz):
+            this_jones = beam.calc_jones(az_rad, za_rad, freq_hz, delays, [1]*16, True)
+            this_jones.shape = (2,2)
+
+            if beam_model=='hyper_rev':
+                jones_per_freq[ind,0,0] = this_jones[1,1]
+                jones_per_freq[ind,0,1] = this_jones[1,0]
+                jones_per_freq[ind,1,0] = this_jones[0,1]
+                jones_per_freq[ind,1,1] = this_jones[0,0]
+            elif beam_model=='hyper_flip':
+                jones_per_freq[ind,0,0] = -this_jones[1,1]
+                jones_per_freq[ind,0,1] = this_jones[1,0]
+                jones_per_freq[ind,1,0] = -this_jones[0,1]
+                jones_per_freq[ind,1,1] = this_jones[0,0]
+            else:
+                jones_per_freq[ind,:,:] = this_jones
+
+        rot_jones_per_freq = rotate_jones_para(ha_rad, dec_rad, jones_per_freq)
+
+    elif beam_model=='rts':
+        rot_jones_per_freq = np.empty((len(freqs_hz),2,2),dtype=complex)
+
+        ##For each frequency, calculate the Jones, and shove into jones_per_freq
+        for ind, freq_hz in enumerate(freqs_hz):
+            ##Beam calculation, via RTS analytic beam code
+            this_jones = RTS_analytic_beam(az_rad, za_rad,  delays, freq_hz, norm=True)
+
+            this_jones.shape = (2,2)
+            rot_jones_per_freq[ind,:,:] = this_jones
+
+    return rot_jones_per_freq
+
+def setup_rm_plot(fig, ha_rad, dec_rad, beam_model='unity',
+                  low_freq=160e+6, high_freq=180e+6, num_samples=200,
+                  frac_pol=0.24, rm=37.41, ref_I_Jy=7.075,
+                  SI=-0.5, ref_V_Jy=0.2436, savefig=False,
+                  delays = [0]*16, nside=301):
+    ##sample evenly in wavelength squared
+    wavelen_low = 3e+8 / high_freq
+    wavelen_high = 3e+8 / low_freq
+    wavelens_squared = np.linspace(wavelen_low**2, wavelen_high**2,num_samples)
+
+    ##convert back to frequencies as that makes the most sense in my head
+    freqs_hz = VELC / np.sqrt(wavelens_squared)
+
+    ##This function applies Equations 9 and 10 above to derive the Q and U values
+    Is_Jy, Qs_Jy, Us_Jy = get_QU_complex(freqs_hz, rm, ref_I_Jy, SI, frac_pol)
+
+    ##This function just applies a spectral index to extrapolate
+    ##flux over frequencies
+    Vs_Jy = extrap_stokes(freqs_hz, ref_V_Jy, SI)
+
+    stokes_source = np.array([Is_Jy, Qs_Jy, Us_Jy, Vs_Jy])
+
+    az_rad, el_rad = erfa.hd2ae(ha_rad, dec_rad, MWA_LAT_RAD)
+    ##Convert elevaltion into zenith angle
+    za_rad = np.pi/2 - el_rad
+
+    wcs, azs_flat, zas_flat, has_flat, decs_flat = get_sin_projected_coords(nside)
+
+    freq_cent = (low_freq + high_freq) / 2
+
+    if beam_model == 'unity':
+        rot_jones_on_sky = np.zeros((len(azs_flat),2,2),dtype=complex)
+        rot_jones_on_sky[:,0,0] = complex(1,0)
+        rot_jones_on_sky[:,1,1] = complex(1,0)
+
+    elif beam_model=='hyper' or beam_model=='hyper_rev' or beam_model=='hyper_flip':
+        ##Create the beam
+        beam = mwa_hyperbeam.FEEBeam()
+        jones_on_sky = beam.calc_jones_array(azs_flat, zas_flat, freq_cent, delays, [1]*16, True)
+        ##I've defined all my plotting stuff for 2x2 jones matrices (long story) so reshape
+        jones_on_sky = remap_hbeam_jones(jones_on_sky)
+
+        rot_jones_on_sky = np.empty((len(azs_flat),2,2),dtype=complex)
+        if beam_model=='hyper_rev':
+            rot_jones_on_sky[:,0,0] = jones_on_sky[:,1,1]
+            rot_jones_on_sky[:,0,1] = jones_on_sky[:,1,0]
+            rot_jones_on_sky[:,1,0] = jones_on_sky[:,0,1]
+            rot_jones_on_sky[:,1,1] = jones_on_sky[:,0,0]
+        elif beam_model=='hyper_flip':
+            rot_jones_on_sky[:,0,0] = -jones_on_sky[:,1,1]
+            rot_jones_on_sky[:,0,1] = jones_on_sky[:,1,0]
+            rot_jones_on_sky[:,1,0] = -jones_on_sky[:,0,1]
+            rot_jones_on_sky[:,1,1] = jones_on_sky[:,0,0]
+        else:
+            rot_jones_on_sky = jones_on_sky
+
+        rot_jones_on_sky = rotate_jones_para(has_flat, decs_flat, rot_jones_on_sky)
+
+    elif beam_model=='rts':
+        rot_jones_on_sky = RTS_analytic_beam_array(azs_flat, zas_flat, delays, freq_cent, norm=True)
+        rot_jones_on_sky = remap_hbeam_jones(rot_jones_on_sky)
+
+
+    rot_jones_per_freq = get_jones_per_freq(az_rad, za_rad, ha_rad, dec_rad, freqs_hz, beam_model=beam_model, delays=delays)
+
+    ##Apply Jones to stokes params and get the FDF
+    stokes_per_freq, faraday_depth, fdf = recover_stokes_rm_from_jones(rot_jones_per_freq,
+                                   stokes_source, wavelens_squared)
+
+    stokesI = [complex(1,0),complex(0,0),complex(0,0),complex(0,0)]
+    inst_pols_sky = apply_instrumental_to_stokes(rot_jones_on_sky, stokesI)
+    recover_stokes_sky = convert_inst_back_to_stokes(inst_pols_sky)
+
+    recover_stokes_skyI = np.real(recover_stokes_sky[:,0,0])
+    recover_stokes_skyI.shape = (nside, nside)
+
+    width = 0.21
+    ytop = 0.6
+    x0 = 0.07
+    y0 = 0.1
+    x1 = x0 + 0.31
+    x2 = x0 + 0.62
+    height = 0.35
+
+    ax1 = fig.add_axes([x0, ytop, width, height])
+    ax2 = fig.add_axes([x1, ytop, width, height])
+    ax3 = fig.add_axes([x2, ytop, width, height])
+    ax4 = fig.add_axes([x0, y0, width, height])
+    ax5 = fig.add_axes([x1, y0, width, height])
+    ax6 = fig.add_axes([x2, y0, width, height])
+
+    ln1, = ax1.plot(freqs_hz/1e6, np.abs(rot_jones_per_freq[:,0,0]))
+    ln4, = ax4.plot(freqs_hz/1e6, np.abs(rot_jones_per_freq[:,1,1]))
+
+    ax1.set_ylabel('Gain')
+    ax4.set_ylabel('Gain')
+
+    ln2, = ax2.plot(freqs_hz/1e6, np.real(stokes_per_freq[:,0,1]),)
+    ln5, = ax5.plot(freqs_hz/1e6, np.real(stokes_per_freq[:,1,0]))
+
+    ax2.set_ylabel('Flux density (Jy)')
+    ax5.set_ylabel('Flux density (Jy)')
+
+    for ax in [ax1,ax2,ax4,ax5]:
+        ax.set_xlabel('Freq (Hz)')
+
+    ln3, = ax3.plot(faraday_depth, abs(fdf), 'C0o-' ,mfc='none')
+    ax3.set_ylabel('abs( $F(\phi) $)')
+    ax3.set_xlabel('$\phi ( \mathrm{rad} \, m^{-2}$)')
+    ax3.axvline(rm,color='k',label='Expected RM',alpha=0.5, linestyle='--')
+    ax3.set_xlim(-100,100)
+    ax3.legend(loc='upper left')
+
+    im = ax6.imshow(np.log10(recover_stokes_skyI))
+
+    source_x, source_y = wcs.all_world2pix(ha_rad/D2R, dec_rad/D2R, 0)
+    circ6, = ax6.plot(source_x, source_y, 'C1o',mfc='none', mew=2.0,label='Source location')
+
+    add_colourbar(ax=ax6,im=im,fig=fig,label='log10[Normalised Beam Stokes I]')
+    ax6.set_xticks([])
+    ax6.set_yticks([])
+    ax6.set_xlabel('HA')
+    ax6.set_ylabel('Dec')
+
+    title = ax6.text(0.5,0.9, "az,za = {:4.1f},{:4.1f}".format(az_rad/D2R, za_rad/D2R), bbox={'facecolor':'w', 'alpha':0.5, 'pad':5},
+                transform=ax6.transAxes, ha="center")
+
+    axs = [ax1, ax2, ax3, ax4, ax5, ax6]
+    iterables = [ln1, ln2, ln3, ln4, ln5, circ6, title]
+
+    titles = ['Amp $g_x$', 'Recover Stokes Q', 'RM synthesis',
+                  'Amp $g_y$', 'Recover Stokes U', 'Beam at {:.3f} MHz'.format(freq_cent/1e+6)]
+    #
+    for ax, title in zip(axs, titles):
+        ax.set_title(title)
+
+    return fig, axs, iterables
+
+def plot_rm_sythnesis(ha_rad, dec_rad, beam_model='unity',
+                      low_freq=160e+6, high_freq=180e+6, num_samples=200,
+                      frac_pol=0.24, rm=37.41, ref_I_Jy=7.075,
+                      SI=-0.5, ref_V_Jy=0.2436, savefig=False,
+                      delays = [0]*16, nside=301):
+
+    fig = plt.figure(figsize=(12,7))
+    fig, axs, iterables = setup_rm_plot(fig, ha_rad, dec_rad, beam_model=beam_model,
+                      low_freq=low_freq, high_freq=high_freq, num_samples=num_samples,
+                      frac_pol=frac_pol, rm=rm, ref_I_Jy=ref_I_Jy,
+                      SI=SI, ref_V_Jy=ref_V_Jy, savefig=savefig,
+                      delays=delays, nside=nside)
+
+    freq_cent = (low_freq + high_freq) / 2
+
+    if savefig:
+        if not os.path.isdir("./rm_beam_plots"):
+            print('Making directory "./rm_beam_plots"')
+            os.mkdir("./rm_beam_plots")
+        else:
+            pass
+        fig.savefig("./rm_beam_plots/{:s}-beam_rm-recover_{:07.1f}MHz-ha{:04.1f}dec{:02.1f}.png".format(beam_model,freq_cent/1e+6,ha_rad/D2R,dec_rad/D2R),bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+    return "./rm_beam_plots/{:s}-beam_rm-recover_{:07.1f}MHz-ha{:04.1f}dec{:02.1f}.png".format(beam_model,freq_cent/1e+6,ha_rad/D2R,dec_rad/D2R)
+
+def rm_sythnesis_movie(has_rad, decs_rad, beam_model='unity', save=True,
+                      low_freq=160e+6, high_freq=180e+6, num_samples=200,
+                      frac_pol=0.24, rm=37.41, ref_I_Jy=7.075,
+                      SI=-0.5, ref_V_Jy=0.2436, savefig=False,
+                      delays = [0]*16, nside=301):
+    # ##sample evenly in wavelength squared
+    wavelen_low = 3e+8 / high_freq
+    wavelen_high = 3e+8 / low_freq
+    wavelens_squared = np.linspace(wavelen_low**2, wavelen_high**2,num_samples)
+
+    ##convert back to frequencies as that makes the most sense in my head
+    freqs_hz = VELC / np.sqrt(wavelens_squared)
+
+    ##This function applies Equations 9 and 10 above to derive the Q and U values
+    Is_Jy, Qs_Jy, Us_Jy = get_QU_complex(freqs_hz, rm, ref_I_Jy, SI, frac_pol)
+
+    ##This function just applies a spectral index to extrapolate
+    ##flux over frequencies
+    Vs_Jy = extrap_stokes(freqs_hz, ref_V_Jy, SI)
+
+    stokes_source = np.array([Is_Jy, Qs_Jy, Us_Jy, Vs_Jy])
+
+    azs_rad, els_rad = erfa.hd2ae(has_rad, decs_rad, MWA_LAT_RAD)
+    ##Convert elevaltion into zenith angle
+    zas_rad = np.pi/2 - els_rad
+
+    fig = plt.figure(figsize=(12,7))
+    fig, axs, iterables = setup_rm_plot(fig, has_rad[0], decs_rad[0], beam_model=beam_model,
+                      low_freq=low_freq, high_freq=high_freq, num_samples=num_samples,
+                      frac_pol=frac_pol, rm=rm, ref_I_Jy=ref_I_Jy,
+                      SI=SI, ref_V_Jy=ref_V_Jy, savefig=savefig,
+                      delays=delays, nside=nside)
+
+    wcs, azs_flat, zas_flat, has_flat, decs_flat = get_sin_projected_coords(nside)
+    ln1, ln2, ln3, ln4, ln5, circ6, title = iterables
+    ax1, ax2, ax3, ax4, ax5, ax6 = axs
+
+    def update(frame):
+
+        rot_jones_per_freq = get_jones_per_freq(azs_rad[frame], zas_rad[frame],
+                             has_rad[frame], decs_rad[frame],
+                             freqs_hz, beam_model=beam_model, delays=delays)
+
+        ##Apply Jones to stokes params and get the FDF
+        stokes_per_freq, faraday_depth, fdf = recover_stokes_rm_from_jones(rot_jones_per_freq,
+                                       stokes_source, wavelens_squared)
+
+        stokesQ = np.real(stokes_per_freq[:,0,1])
+        stokesU = np.real(stokes_per_freq[:,1,0])
+
+        gain1 = np.abs(rot_jones_per_freq[:,0,0])
+        gain2 = np.abs(rot_jones_per_freq[:,1,1])
+
+        ln2.set_data(freqs_hz/1e6, stokesQ)
+        ln5.set_data(freqs_hz/1e6, stokesU)
+
+        ln1.set_data(freqs_hz/1e6, gain1)
+        ln4.set_data(freqs_hz/1e6, gain2)
+
+        ln3.set_data(faraday_depth, abs(fdf))
+
+        for ax, data in zip([ax1, ax2, ax3, ax4, ax5], [gain1, stokesQ, abs(fdf), gain2, stokesU]):
+            offset = (data.max() - data.min()) / 10.0
+            ax.set_ylim(data.min()-offset, data.max()+offset)
+
+
+        source_x, source_y = wcs.all_world2pix(has_rad[frame]/D2R, decs_rad[frame]/D2R, 0)
+        circ6.set_data(source_x, source_y)
+
+        title.set_text("az,za = {:4.1f},{:4.1f}".format(azs_rad[frame]/D2R, zas_rad[frame]/D2R))
+
+        return iterables
+
+    ani = animation.FuncAnimation(fig, update, frames=np.arange(0,len(has_rad)),
+                     blit=True) #
+
+    freq_cent = (low_freq + high_freq) / 2
+    if save:
+        ani.save('{:s}_rm-on-sky_{:7.3f}MHz.mp4'.format(beam_model,freq_cent/1e+6),
+                  writer='ffmpeg', fps=1)
+
+    return ani
